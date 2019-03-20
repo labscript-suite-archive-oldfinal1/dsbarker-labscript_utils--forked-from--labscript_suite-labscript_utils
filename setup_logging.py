@@ -11,9 +11,14 @@
 #                                                                   #
 #####################################################################
 from __future__ import division, unicode_literals, print_function, absolute_import
+from labscript_utils import PY2
+if PY2:
+    str = unicode
 
 import sys, os
 import logging, logging.handlers
+from labscript_utils.ls_zprocess import Handler, ensure_connected_to_zlog
+
 import __main__
 
 
@@ -26,6 +31,10 @@ class LessThanFilter(logging.Filter):
 
 
 def setup_logging(program_name, log_level=logging.DEBUG, terminal_level=logging.INFO, maxBytes=1024*1024*50, backupCount=1):
+    # MayBytes and backupCount args ignored, these are now set in labconfig since they
+    # are settings to the server rather than individual logging handlers. Args are left
+    # in the function signature for backward compatibility.
+    ensure_connected_to_zlog()
     logger = logging.getLogger(program_name)
     # Clear any previously added handlers from the logger:
     for handler in logger.handlers[:]:
@@ -41,7 +50,8 @@ def setup_logging(program_name, log_level=logging.DEBUG, terminal_level=logging.
 
     log_dir = os.path.dirname(os.path.realpath(main_path))
     log_path = os.path.join(log_dir, '%s.log' % program_name)
-    handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=maxBytes, backupCount=backupCount)
+    # Add a network logging handler from zprocess:
+    handler = Handler(log_path)
     formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
     handler.setFormatter(formatter)
     handler.setLevel(log_level)
