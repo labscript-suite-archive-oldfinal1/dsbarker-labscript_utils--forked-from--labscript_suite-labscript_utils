@@ -8,15 +8,15 @@
 # for the full license.                                             #
 #                                                                   #
 # This camera server is an extension of camera_server.py.           #
-# PySpin_camera_server implements a server and BLACS            #
-# cameras using FLIR's python wrapper for FlyCapture2.              #
+# pyspin_server implements a server and BLACS            #
+# cameras using FLIR's python wrapper for PySpin.              #
 #                                                                   #
 # To start the server:                                              #
 # Run a command line in the directory containing this file          #
 # and type:                                                         #
-# python PySpin_camera_server.py <cameraNameFromBlacs>          #
+# python pyspin_server.py <cameraNameFromBlacs>          #
 # or type:                                                          #
-# python PySpin_camera_server <cameraNameFromBlacs>             #
+# python pyspin_server <cameraNameFromBlacs>             #
 # <width> <height> <offsetX> <offsetY>                              #
 # The optional inputs <width>, <height>, <offsetX>, and             #
 # <offsetY> define an acquistion ROI for the camera.                #
@@ -205,7 +205,7 @@ def set_ROI(cam, width, height, offsetX, offsetY):
             width = 16*int(np.ceil( (width - cam.Width.GetMin())/16. )) +\
                 cam.Width.GetMin()
             logger.warning('Setting width to %d to match rules!' % width)
-        if width > cam.Height.GetMax() or width < cam.Height.GetMin():
+        if width > cam.Width.GetMax() or width < cam.Width.GetMin():
             logger.error('Width %d either too large or too small!' % width)
         else:
             set_property(cam.Width, int(width))
@@ -235,9 +235,9 @@ def set_ROI(cam, width, height, offsetX, offsetY):
         if (offsetY - cam.OffsetY.GetMin()) % 8 != 0:
             offsetY = 2*int(np.round( (offsetY - cam.OffsetY.GetMin())/2. )) +\
                 cam.OffsetY.GetMin()
-            logger.warning('Setting X offset to %d to match rules!' % offsetX)
+            logger.warning('Setting Y offset to %d to match rules!' % offsetX)
         if offsetY > cam.OffsetY.GetMax() or offsetY < cam.OffsetY.GetMin():
-            logger.error('X offset %d either too large or too small!' % offsetX)
+            logger.error('Y offset %d either too large or too small!' % offsetX)
         else:
             set_property(cam.OffsetY, int(offsetY))
 
@@ -407,16 +407,29 @@ class PySpin_CameraServer(zprocess.ZMQServer):
             groupname = self.camera_name
             group = f['devices'][groupname]
             props = labscript_utils.properties.get(f, camera_name,'device_properties')
-            if not 'EXPOSURES' in group:
-                print('no camera exposures in this shot.')
+            n_images = 0
+            exp_times = []
+
+            if not 'EXPOSURES' in group and not 'VIDEOS' in group:
+                print('no camera exposures or videos in this shot.')
                 return
-            n_images = len(group['EXPOSURES'])
+            #n_images = len(group['EXPOSURES'])
+            if 'EXPOSURES' in group:
+                n_images = len(group['EXPOSURES'])
+                exp_times = group['EXPOSURES']['time']
+
+            if 'VIDEOS' in group:
+                for videoFrameCount in group['VIDEOS']['number_of_frames']:
+                    n_images += int(videoFrameCount)
+                for videoFrameTimes in group['VIDEOS']['time']:
+                    np.append(exp_times, videoFrameTimes)
+
             # Find max time between images:
             if n_images > 1:
-                exp_times = f['devices'][groupname]['EXPOSURES']['time']
                 max_wait = 1.5*max(exp_times[0], max(abs(x - y) for (x, y) in zip(exp_times[1:], exp_times[:-1])))
             else:
-                max_wait = 0.1
+                max_wait = 1.5*exp_times[0] # Don't timeout if there's one image.
+
             # Use acquisition_ROI property to set camera ROI:
             if 'acquisition_ROI' in props:
                 if props['acquisition_ROI'] is not None:
@@ -437,48 +450,76 @@ class PySpin_CameraServer(zprocess.ZMQServer):
         with h5py.File(h5_filepath) as f:
             groupname = self.camera_name
             group = f['devices'][groupname]
-            if not 'EXPOSURES' in group:
-                self.logger.warning('no camera exposures in this shot.')
+            if not 'EXPOSURES' in group and not 'VIDEOS' in group:
+                self.logger.warning('no camera exposures or videos in this shot.')
                 return
-            n_images = len(group['EXPOSURES'])
-            # For some reason, the h5 file is being read as bytes and not a string:
-            img_type = f['devices'][groupname]['EXPOSURES']['frametype']
-            img_set = list(set(img_type))
+
+            if 'EXPOSURES' in group:
+                n_images = len(group['EXPOSURES'])
+                exp_times = group['EXPOSURES']['time']
+                exposuresGroup = f.create_group('/images/' + f['devices'][groupname].attrs.get('orientation') + '/' + groupname)
+            else:
+                exposuresGroup = None
+
+            if 'VIDEOS' in group:
+                for videoFrameCount in group['VIDEOS']['number_of_frames']:
+                    n_images += videoFrameCount
+                videosGroup = f.create_group('/videos/' + f['devices'][groupname].attrs.get('orientation') + '/' + groupname)
+            else:
+                videosGroup = None
+
             try:
-                images = self.results_queue.get(timeout=1)
+                images = self.results_queue.get(timeout=1) #returned in time order
             except Queue.Empty:
                 self.logger.error('There was some problem in the acquisition!')
                 images = []
 
             # The number of images that comes back must be equal
             if len(images) != n_images:
+                #If this error is thrown, there is most likely an issue with the range() function implemented in PythonCamera.py
                 raise ValueError('Did not capture all the images expected!')
 
             # Save images only if there
             n_acq = len(images)
             self.logger.info('Saving {a} images.'.format(a=n_acq))
-            # Create the group in which we will save the images:
-            group = f.create_group('/images/' + f['devices'][groupname].attrs.get('orientation') + '/' + groupname)
+
+            #img_type = []
+            img_type_list = [] #double array or single? how to sort it?
+            if not exposuresGroup is None:
+                for exposure in group['EXPOSURES']:
+                    img_type_list.append((exposure['time'], exposure['name']))
+            if not videosGroup is None:
+                for video in group['VIDEOS']:
+                        for frameTime in np.arange(video['time'], video['time'] + video['video_length'], video['time_between_frames']): #video.get('time'), video.get('time_between_frames'), video.get('time') + video.get('video_length')
+                            img_type_list.append((frameTime, video['name'])) #video.get('name')
+
+            img_type_list = sorted(img_type_list) #sorts them by time?
+            img_type = [img_type_list_i[1] for img_type_list_i in img_type_list]
+
+            img_set = list(set(img_type))
+
             self.logger.info(
                 'Preparation for saving time: ' + \
                 '{0:.6f}'.format(time.time() - start_time)+ 's')
+
             # Save images:
-            imgs_toSave = {}
             for f_type in img_set:
                 start_time = time.time()
-                imgs_toSave[f_type] = []
-                idx = 0
-                # all images should be same size:
-                for idx in range(n_acq):
-                    if img_type[idx] == f_type:
-                        imgs_toSave[f_type].append(images[idx])
-                # print('Creating dataset.')
-                group.create_dataset(f_type,data=np.array(imgs_toSave[f_type]))
-                """images_to_save = [imgs[idx] if img_type[idx] == f_type for idx in range(n_acq)]
-                group.create_dataset(f_type,data=np.array(images_to_save))"""
+
+                idx = [img_type_list_i[1] == f_type for img_type_list_i in img_type_list]
+
+                #The below code will create a data set labeled 'exposures' under /images/... along with
+                #storing the videos under /videos/.../video.name
+                if 'EXPOSURES' in group and f_type in group['EXPOSURES']['name']:
+                    exposuresGroup.create_dataset(f_type, data=images[idx][0])
+                elif 'VIDEOS' in group and f_type in group['VIDEOS']['name']:
+                    videosGroup.create_dataset(f_type, data=images[idx])
+                else:
+                    raise ValueError("Do not recognize frame!")
+
                 self.logger.info(
                     _ensure_str(f_type) + ' camera shots saving time: ' + \
-                    '{0:.6f}'.format(time.time() - start_time)+ 's')
+                    '{0:.6f}'.format(time.time() - start_time) + 's')
 
     def abort(self):
         # If abort gets called, probably need to break out of grabMultiple.
